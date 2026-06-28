@@ -14,7 +14,7 @@ app = FastAPI(title="devsecops-training-demo")
 @app.get("/health")
 def health() -> dict:
     """Endpoint de santé, utilisé par les tests et les futurs checks de déploiement."""
-    return {"status": "ok"}
+    return {"server status": "ok"}
 
 
 @app.get("/version")
