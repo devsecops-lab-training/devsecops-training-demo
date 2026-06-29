@@ -100,6 +100,7 @@ jobs:
           # Pas d'upload SARIF ici : nécessite GitHub Advanced Security,
           # indisponible sur repo privé. Résultat affiché en clair
           # directement dans les logs de ce step.
+          config: .hadolint.yaml
           no-fail: false
 
   # ───────────────────────────────────────────────
@@ -192,3 +193,8 @@ jobs:
           echo ""
           echo "Cette image est destinée au développement/training uniquement."
           echo "Pour la production, utiliser le pipeline CD staging -> promote."
+
+      # ─── Vérifier la signature (preuve) ───
+      - name: Vérifier la signature Cosign
+        run: |
+          cosign verify             --certificate-identity-regexp="https://github.com/${{ github.repository }}/"             --certificate-oidc-issuer="https://token.actions.githubusercontent.com"             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:scratch-1.0.0
