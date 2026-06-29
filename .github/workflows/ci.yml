@@ -159,9 +159,11 @@ jobs:
         run: |
           docker run -d --name smoke-test -p 8000:8000 scan-target:latest
           echo "Attente du démarrage..."
-          sleep 5
-          curl -sf http://localhost:8000/health
+          sleep 10
+          echo "--- Logs du conteneur ---"
           docker logs smoke-test
+          echo "--- Test de l'endpoint /health ---"
+          curl -sf http://localhost:8000/health
           docker stop smoke-test
           docker rm smoke-test
 
