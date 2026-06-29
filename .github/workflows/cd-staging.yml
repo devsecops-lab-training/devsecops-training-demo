@@ -1,6 +1,9 @@
 name: CD - Build & Publish Staging
 
-# CD = "je publie un artefact".
+# CD = "je publie un artefact" — mais on ne publie JAMAIS sans avoir
+# d'abord revalidé le code à l'instant du tag (indépendamment de ce qui
+# a déjà été validé plus tôt sur develop). C'est le job "validate" ici.
+#
 # Se déclenche UNIQUEMENT sur un tag Git de la forme vX.Y.Z, posé sur develop.
 # C'est ICI, et seulement ici, que l'image est construite et publiée.
 # Elle ne sera ensuite JAMAIS reconstruite : Stable = promotion, pas rebuild.
@@ -14,7 +17,29 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Installer les dépendances
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check app/ tests/
+
+      - name: Tests (pytest)
+        run: pytest -v
+
   build-and-publish-staging:
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
