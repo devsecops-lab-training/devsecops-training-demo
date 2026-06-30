@@ -40,7 +40,9 @@ def info() -> dict:
         "version": os.getenv("APP_VERSION", "dev"),
     }
 
+
 _request_count = 0
+
 
 @app.get("/stats")
 def stats() -> dict:
