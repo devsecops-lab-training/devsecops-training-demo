@@ -39,3 +39,12 @@ def info() -> dict:
         "status": "running",
         "version": os.getenv("APP_VERSION", "dev"),
     }
+
+_request_count = 0
+
+@app.get("/stats")
+def stats() -> dict:
+    """Retourne un compteur simple du nombre d'appels à cet endpoint."""
+    global _request_count
+    _request_count += 1
+    return {"stats_calls": _request_count}

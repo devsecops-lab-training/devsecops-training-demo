@@ -23,3 +23,8 @@ def test_info() -> None:
     body = response.json()
     assert body["app_name"] == "devsecops-training-demo"
     assert body["status"] == "running"
+
+def test_stats_increments() -> None:
+    first = client.get("/stats").json()["stats_calls"]
+    second = client.get("/stats").json()["stats_calls"]
+    assert second == first + 1
