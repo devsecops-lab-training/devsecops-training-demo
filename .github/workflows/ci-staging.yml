@@ -62,10 +62,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Scan de secrets (Gitleaks)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan de secrets (TruffleHog)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ""
+          head: HEAD
+          extra_args: --debug
 
       - name: Setup Python
         uses: actions/setup-python@v5
