@@ -1,15 +1,5 @@
 name: CI - Scratch - Validation & Build
 
-# CI = "est-ce que le code est bon ?" + "est-ce que l'image est saine ?"
-# Se déclenche sur toute branche de travail ET sur les Pull Requests
-# vers develop ou master.
-#
-# Ce pipeline publie une image de développement/scratch pour démo/training
-# avec un tag UNIQUE par run (ex: scratch-42-abc1234), jamais figé en dur.
-# ATTENTION : pour que le push GHCR fonctionne sur les événements
-# pull_request, le repo doit avoir : Settings > Actions > General >
-# Workflow permissions = "Read and write permissions".
-
 on:
   push:
     branches:
@@ -28,9 +18,6 @@ permissions:
   contents: read
 
 jobs:
-  # ───────────────────────────────────────────────
-  # JOB 1 : Sécurité & Qualité du code
-  # ───────────────────────────────────────────────
   security-and-quality:
     runs-on: ubuntu-latest
     permissions:
@@ -41,12 +28,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Scan de secrets (Gitleaks)
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-            
+      - name: Scan de secrets (TruffleHog)
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: develop
+          head: HEAD
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -57,9 +45,6 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Audit des dépendances (pip-audit)
-        # continue-on-error : ce contrôle est informationnel pour l'instant.
-        # Le futur Module 5 (Analyse des dépendances) le rendra bloquant,
-        # avec une vraie procédure de remédiation.
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --desc --format=markdown
@@ -82,9 +67,6 @@ jobs:
           pip install pytest pytest-cov
           pytest -v --cov=app --cov-report=term
 
-  # ───────────────────────────────────────────────
-  # JOB 2 : Validation du Dockerfile
-  # ───────────────────────────────────────────────
   dockerfile-lint:
     runs-on: ubuntu-latest
     permissions:
@@ -97,15 +79,9 @@ jobs:
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
-          # Pas d'upload SARIF ici : nécessite GitHub Advanced Security,
-          # indisponible sur repo privé. Résultat affiché en clair
-          # directement dans les logs de ce step.
           config: .hadolint.yaml
           no-fail: false
 
-  # ───────────────────────────────────────────────
-  # JOB 3 : Build, Scan & Publish Scratch Image
-  # ───────────────────────────────────────────────
   build-scan-publish-scratch:
     needs: [security-and-quality, dockerfile-lint]
     runs-on: ubuntu-latest
@@ -139,8 +115,7 @@ jobs:
           context: .
           push: false
           load: true
-          tags: |
-            scan-target:latest
+          tags: scan-target:latest
           build-args: |
             APP_VERSION=${{ steps.meta.outputs.SCRATCH_TAG }}
           cache-from: type=gha
@@ -211,4 +186,4 @@ jobs:
           echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:scratch-latest"
           echo ""
           echo "Cette image est destinée au développement/training uniquement."
-          echo "Pour la production, utiliser le pipeline CD staging -> promote."
+          echo "Pour la production, utiliser le pipeline CI - Staging."
