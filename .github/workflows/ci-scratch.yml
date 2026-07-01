@@ -32,8 +32,9 @@ jobs:
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: develop
+          base: ""
           head: HEAD
+          extra_args: --debug
 
       - name: Setup Python
         uses: actions/setup-python@v5
