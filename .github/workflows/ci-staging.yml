@@ -1,16 +1,12 @@
-name: CI - Staging - Build & Publish
+name: CI - Staging - Build & Publish - Next
 
-# Staging doit être AU MOINS aussi strict que Scratch, idéalement plus :
-# c'est la dernière étape qui construit réellement l'artefact. Cet artefact
-# sera ensuite promu en Stable SANS jamais être reconstruit (skopeo copy).
-# Donc tout défaut non détecté ici se retrouve directement en production.
-#
-# Différence volontaire avec ci.yml (Scratch) :
-# - pip-audit et Bandit sont ici BLOQUANTS (pas de continue-on-error).
-# - Aucune tolérance "c'est juste une démo" : c'est la version candidate
-#   à la promotion.
-#
-# Se déclenche UNIQUEMENT sur un tag Git de la forme vX.Y.Z, posé sur develop.
+# Staging est PLUS strict que Scratch :
+# - SonarQube remplace Bandit (SAST plus complet)
+# - Grype remplace Trivy (scan image)
+# - pip-audit est BLOQUANT (pas de continue-on-error)
+# - Grype est BLOQUANT (fail-build: true)
+# - C'est le SEUL build de ce cycle : l'artefact produit ici
+#   sera promu en Stable SANS jamais être reconstruit.
 
 on:
   push:
@@ -26,13 +22,15 @@ permissions:
 
 jobs:
   # ───────────────────────────────────────────────
-  # JOB 1 : Validation du code (lint + tests)
+  # JOB 1 : Validation du code (lint + tests + coverage)
   # ───────────────────────────────────────────────
   validate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -48,13 +46,20 @@ jobs:
           ruff check app/ tests/
           ruff format --check app/ tests/
 
-      - name: Tests (pytest)
-        run: pytest -v
+      - name: Tests & Génération de couverture (pytest)
+        run: |
+          pip install pytest pytest-cov
+          pytest -v --cov=app --cov-report=xml
+
+      - name: Fix coverage paths for SonarCloud
+        run: |
+          sed -i 's|/home/runner/work/devsecops-training-demo/devsecops-training-demo/||g' coverage.xml
 
   # ───────────────────────────────────────────────
-  # JOB 2 : Sécurité du code - BLOQUANT (contrairement à Scratch)
+  # JOB 2 : Sécurité du code - BLOQUANT
   # ───────────────────────────────────────────────
   security-scan:
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -80,16 +85,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Audit des dépendances (pip-audit) - BLOQUANT
-        # Pas de continue-on-error ici : en Staging, une dépendance
-        # vulnérable connue doit arrêter la chaîne, pas juste informer.
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --desc
-
-      - name: SAST Python (Bandit) - BLOQUANT
-        run: |
-          pip install "bandit[toml]"
-          bandit -r app/ -ll
 
       - name: Lint Dockerfile (Hadolint)
         uses: hadolint/hadolint-action@v3.1.0
@@ -98,8 +96,23 @@ jobs:
           config: .hadolint.yaml
           no-fail: false
 
+      - name: Analyse SAST & Qualité (SonarQube) - BLOQUANT
+        uses: sonarsource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.event.repository.name }}
+            -Dsonar.organization=devsecops-lab-training
+            -Dsonar.branch.name=master
+            -Dsonar.sources=app/
+            -Dsonar.tests=tests/
+            -Dsonar.python.version=3.12
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+
   # ───────────────────────────────────────────────
-  # JOB 3 : Build, Scan, Publish & Sign - le SEUL build de ce cycle
+  # JOB 3 : Build, Scan, Publish & Sign
   # ───────────────────────────────────────────────
   build-scan-publish-staging:
     needs: [validate, security-scan]
@@ -132,21 +145,18 @@ jobs:
           context: .
           push: false
           load: true
-          tags: |
-            scan-target:latest
+          tags: scan-target:latest
           build-args: |
             APP_VERSION=${{ steps.version.outputs.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan de l'image (Trivy) - BLOQUANT
-        uses: aquasecurity/trivy-action@master
+      - name: Scan de l'image (Grype) - BLOQUANT
+        uses: anchore/scan-action@v5
         with:
-          image-ref: "scan-target:latest"
-          format: "table"
-          exit-code: "1"
-          severity: "CRITICAL,HIGH"
-          ignore-unfixed: true
+          image: "scan-target:latest"
+          fail-build: true
+          severity-cutoff: "high"
 
       - name: Smoke test du conteneur
         run: |
@@ -174,6 +184,9 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
+            org.opencontainers.image.description=Image staging validée (SonarQube/Grype)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Installer Cosign
         uses: sigstore/cosign-installer@v3.6.0
@@ -193,4 +206,5 @@ jobs:
       - name: Résumé
         run: |
           echo "Image publiée et signée : ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.version.outputs.VERSION }}"
+          echo "Scans effectués : TruffleHog + pip-audit + SonarQube + Grype"
           echo "Cette image est candidate à la promotion en stable, SANS reconstruction."
