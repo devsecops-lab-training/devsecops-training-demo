@@ -119,4 +119,3 @@ def config() -> dict:
         "debug": cfg.debug,
         "features": cfg.features,
     }
-
