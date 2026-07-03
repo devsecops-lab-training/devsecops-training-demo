@@ -1,4 +1,4 @@
-name: CI - Scratch - Validation & Build
+name: CI - Scratch - Validation & Build - Next
 
 on:
   push:
