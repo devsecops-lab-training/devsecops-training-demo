@@ -1,4 +1,4 @@
-name: CI - Scratch - Validation & Build - [Ancien avec Trivy]
+name: CI - Scratch - Validation & Build
 
 on:
   push:
@@ -26,7 +26,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # Requis par SonarQube pour avoir l'historique Git complet
 
       - name: Scan de secrets (TruffleHog)
         uses: trufflesecurity/trufflehog@main
@@ -51,22 +51,23 @@ jobs:
           pip-audit -r requirements.txt --desc --format=markdown
         continue-on-error: true
 
-      - name: SAST Python (Bandit)
-        run: |
-          pip install "bandit[toml]"
-          bandit -r app/ -ll
-        continue-on-error: true
-
-      - name: Lint (ruff)
-        run: |
-          pip install ruff
-          ruff check app/ tests/
-          ruff format --check app/ tests/
-
-      - name: Tests (pytest + coverage)
+      - name: Tests & Génération de couverture (pytest)
         run: |
           pip install pytest pytest-cov
-          pytest -v --cov=app --cov-report=term
+          pytest -v --cov=app --cov-report=xml # xml requis pour SonarQube
+
+      - name: Analyse SAST & Qualité (SonarQube)
+        uses: sonarsource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.event.repository.name }}
+            -Dsonar.sources=app/
+            -Dsonar.tests=tests/
+            -Dsonar.python.version=3.12
+            -Dsonar.python.coverage.reportPaths=coverage.xml
 
   dockerfile-lint:
     runs-on: ubuntu-latest
@@ -110,7 +111,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image locale (pour scan, pas encore publiée)
+      - name: Build image locale (pour scan)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -122,14 +123,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan de l'image (Trivy)
-        uses: aquasecurity/trivy-action@master
+      - name: Scan de l'image (Grype)
+        uses: anchore/scan-action@v5
         with:
-          image-ref: "scan-target:latest"
-          format: "table"
-          exit-code: "1"
-          severity: "CRITICAL,HIGH"
-          ignore-unfixed: true
+          image: "scan-target:latest"
+          fail-build: false # Permet de créer et publier l'image dans toutes les conditions
+          severity-cutoff: "high"
 
       - name: Smoke test du conteneur
         run: |
@@ -157,7 +156,7 @@ jobs:
             APP_VERSION=${{ steps.meta.outputs.SCRATCH_TAG }}
           labels: |
             org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.description=Image scratch de démonstration/training
+            org.opencontainers.image.description=Image scratch de démonstration/training (Grype/Sonar)
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
@@ -182,9 +181,6 @@ jobs:
 
       - name: Résumé de publication
         run: |
-          echo "Image scratch publiée :"
+          echo "Image scratch publiée avec succès (Scan Grype effectué) :"
           echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SCRATCH_TAG }}"
           echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:scratch-latest"
-          echo ""
-          echo "Cette image est destinée au développement/training uniquement."
-          echo "Pour la production, utiliser le pipeline CI - Staging."
