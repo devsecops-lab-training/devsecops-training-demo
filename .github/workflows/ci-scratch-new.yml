@@ -64,6 +64,7 @@ jobs:
         with:
           args: >
             -Dsonar.projectKey=${{ github.event.repository.name }}
+            -Dsonar.organization=devsecops-lab-training
             -Dsonar.sources=app/
             -Dsonar.tests=tests/
             -Dsonar.python.version=3.12
