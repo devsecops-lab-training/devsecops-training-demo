@@ -1,12 +1,57 @@
-name: CI - Staging - Build & Publish - Next
+name: CI - Staging - Build & Publish
 
-# Staging est PLUS strict que Scratch :
-# - SonarQube remplace Bandit (SAST plus complet)
-# - Grype remplace Trivy (scan image)
-# - pip-audit est BLOQUANT (pas de continue-on-error)
-# - Grype est BLOQUANT (fail-build: true)
-# - C'est le SEUL build de ce cycle : l'artefact produit ici
-#   sera promu en Stable SANS jamais être reconstruit.
+# =============================================================================
+# RÔLE DE CE PIPELINE
+# =============================================================================
+# Staging est LE point de contrôle ultime avant la production.
+# L'artefact produit ici sera promu en Stable SANS jamais être reconstruit
+# (copie bit-à-bit via skopeo). Tout défaut non détecté ici se retrouve
+# directement en production.
+#
+# Ce pipeline est PLUS strict que Scratch sur tous les points :
+#   - pip-audit   : BLOQUANT (continue-on-error: false)
+#   - SonarQube   : BLOQUANT (SAST + qualité + couverture)
+#   - Grype       : BLOQUANT (fail-build: true, CVE HIGH/CRITICAL)
+#   - SBOM        : généré en CycloneDX + SPDX, attaché à l'image (Cosign attest)
+#   - Cosign      : signature keyless vérifiée
+#
+# =============================================================================
+# ARCHITECTURE DES JOBS ET FLUX DE DONNÉES
+# =============================================================================
+#
+#   validate ──────────────────────────────────────────────────────────────┐
+#   - lint (ruff)                                                          │
+#   - pytest + coverage.xml                                                │ artifact
+#   - Fix coverage paths                                                   │ "coverage-report"
+#   - Upload coverage.xml ─────────────────────────────────────────────────┤
+#                                                                          │
+#   security-scan ─────────────────────────────────────────────────────────┤
+#   - Download coverage.xml ◄──────────────────────────────────────────────┘
+#   - TruffleHog (secrets)
+#   - pip-audit (SCA dépendances Python) BLOQUANT
+#   - OWASP Dependency-Check (SCA multi-langages) informatif
+#   - Hadolint (Dockerfile)
+#   - SonarQube (SAST + couverture) BLOQUANT
+#                                                                          │
+#   build-scan-publish-staging ◄───────────────────────────────────────────┘
+#   - Build image locale (scan-target, jamais publiée)
+#   - Grype (CVE image) BLOQUANT
+#   - Smoke test
+#   - Build + push staging-X.Y.Z
+#   - Syft → SBOM CycloneDX + SPDX → artifact 90j
+#   - Cosign attest (SBOM attaché à l'image)
+#   - Cosign sign (signature de l'image)
+#   - Cosign verify (auto-contrôle)
+#
+# =============================================================================
+# POURQUOI DES ARTIFACTS ENTRE LES JOBS ?
+# =============================================================================
+# Chaque job tourne sur une VM SÉPARÉE et ÉPHÉMÈRE — les fichiers produits
+# par un job ne sont PAS accessibles par les autres. Les artifacts GitHub
+# Actions sont le mécanisme officiel pour transférer des fichiers entre jobs.
+# Sans upload/download-artifact, SonarQube analyserait sans coverage.xml
+# (silencieusement, sans erreur — c'est le pire cas : un faux sentiment de
+# sécurité).
 
 on:
   push:
@@ -21,16 +66,18 @@ permissions:
   contents: read
 
 jobs:
-  # ───────────────────────────────────────────────
-  # JOB 1 : Validation du code (lint + tests + coverage)
-  # ───────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 1 : Validation du code
+  # Produit  : coverage.xml (uploadé comme artifact pour SonarQube)
+  # Bloquant : lint (ruff), tests (pytest)
+  # ───────────────────────────────────────────────────────────────────────
   validate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Requis par SonarQube pour l'historique complet
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -52,14 +99,29 @@ jobs:
           pytest -v --cov=app --cov-report=xml
 
       - name: Fix coverage paths for SonarCloud
+        # SonarQube attend des chemins RELATIFS dans coverage.xml.
+        # pytest génère des chemins ABSOLUS propres à la VM du runner.
+        # Ce sed remplace le préfixe absolu par rien → chemins relatifs.
         run: |
           sed -i 's|/home/runner/work/devsecops-training-demo/devsecops-training-demo/||g' coverage.xml
 
-  # ───────────────────────────────────────────────
-  # JOB 2 : Sécurité du code - BLOQUANT
-  # ───────────────────────────────────────────────
+      - name: Upload coverage report
+        # Rend coverage.xml disponible pour le job security-scan
+        # qui tourne sur une VM différente et isolée.
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 1  # Fichier temporaire de pipeline, inutile à conserver
+
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 2 : Sécurité du code — TOUS LES CONTRÔLES SONT BLOQUANTS
+  # Consomme : coverage.xml (artifact du job validate)
+  # Bloquant : TruffleHog, pip-audit, SonarQube, Hadolint
+  # Informatif : OWASP Dependency-Check (progressif → bloquant après audit)
+  # ───────────────────────────────────────────────────────────────────────
   security-scan:
-    needs: validate
+    needs: validate  # Attend validate pour disposer de coverage.xml
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -67,7 +129,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Download coverage report
+        # Télécharge coverage.xml produit par validate dans le répertoire
+        # courant de cette nouvelle VM, pour le passer à SonarQube.
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+
       - name: Scan de secrets (TruffleHog)
+        # TruffleHog analyse tout l'historique Git (fetch-depth: 0)
+        # à la recherche de secrets commités (tokens, clés API, mots de passe).
+        # Un secret trouvé = pipeline arrêté immédiatement.
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
@@ -84,10 +156,37 @@ jobs:
       - name: Installer les dépendances
         run: pip install -r requirements.txt
 
-      - name: Audit des dépendances (pip-audit) - BLOQUANT
+      - name: SCA - Audit des dépendances Python (pip-audit) — BLOQUANT
+        # pip-audit compare requirements.txt contre la base OSV (Google)
+        # et PyPA Advisory Database. Détecte les CVE dans les dépendances
+        # DÉCLARÉES dans requirements.txt uniquement (pas les transitives OS).
+        # En Staging : pas de continue-on-error, toute CVE connue bloque.
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --desc
+
+      - name: SCA - OWASP Dependency-Check — informatif
+        # OWASP DC utilise la base NVD (NIST) — référence standard en
+        # entreprise et dans les certifications (ISO 27001, IEC 62443).
+        # Complémentaire à pip-audit : couvre aussi les dépendances
+        # transitives et les paquets non-Python.
+        # continue-on-error: true = phase d'observation initiale.
+        # À rendre bloquant après analyse des premiers rapports.
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.event.repository.name }}
+          path: '.'
+          format: 'HTML'
+          out: 'reports/dependency-check'
+        continue-on-error: true
+
+      - name: Upload rapport OWASP Dependency-Check
+        uses: actions/upload-artifact@v4
+        if: always()  # Toujours uploader, même si le scan a trouvé des CVE
+        with:
+          name: owasp-dependency-check-report
+          path: reports/dependency-check
+          retention-days: 30
 
       - name: Lint Dockerfile (Hadolint)
         uses: hadolint/hadolint-action@v3.1.0
@@ -96,7 +195,12 @@ jobs:
           config: .hadolint.yaml
           no-fail: false
 
-      - name: Analyse SAST & Qualité (SonarQube) - BLOQUANT
+      - name: SAST & Qualité (SonarQube) — BLOQUANT
+        # SonarQube analyse le code Python à la recherche de :
+        # - vulnérabilités (injection, XSS, secrets hardcodés...)
+        # - code smells (dette technique)
+        # - taux de couverture (via coverage.xml téléchargé plus haut)
+        # Bloquant : si le Quality Gate SonarQube échoue, le pipeline s'arrête.
         uses: sonarsource/sonarqube-scan-action@v3
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -111,35 +215,45 @@ jobs:
             -Dsonar.python.version=3.12
             -Dsonar.python.coverage.reportPaths=coverage.xml
 
-  # ───────────────────────────────────────────────
-  # JOB 3 : Build, Scan, Publish & Sign
-  # ───────────────────────────────────────────────
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 3 : Build, Scan image, Publish, SBOM & Sign
+  # C'est LE SEUL job qui construit et publie une image Docker.
+  # Principe "scan before publish" : l'image est scannée AVANT publication.
+  # ───────────────────────────────────────────────────────────────────────
   build-scan-publish-staging:
     needs: [validate, security-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
+      id-token: write  # Requis par Cosign (OIDC keyless) et cosign attest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Extraire la version depuis le tag
         id: version
+        # GITHUB_REF_NAME = "v2.1.0" → on supprime le "v" → "2.1.0"
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Connexion au registre GHCR
+        # Ce login est utilisé par Docker (build+push) ET par Cosign
+        # (sign + attest). Sans ce login, Cosign ne peut pas pousser
+        # les signatures et attestations vers GHCR.
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image locale (pour scan, pas encore publiée)
+      - name: Build image locale (scan-target, jamais publiée)
+        # On construit d'abord en local (push: false, load: true) pour
+        # scanner l'image AVANT de la rendre disponible dans le registre.
+        # Une image vulnérable ne doit jamais être accessible publiquement,
+        # même brièvement — c'est le principe "scan before publish".
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -151,7 +265,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan de l'image (Grype) - BLOQUANT
+      - name: Scan de l'image (Grype) — BLOQUANT
+        # Grype scanne TOUT ce qui est dans l'image : paquets OS (Debian),
+        # libs système, dépendances Python transitives — pas seulement
+        # requirements.txt. Complémentaire à pip-audit.
+        # fail-build: true → CVE HIGH/CRITICAL = pipeline arrêté, aucune
+        # image publiée. Contrairement à Scratch (fail-build: false).
         uses: anchore/scan-action@v5
         with:
           image: "scan-target:latest"
@@ -159,6 +278,9 @@ jobs:
           severity-cutoff: "high"
 
       - name: Smoke test du conteneur
+        # Vérifie que l'image démarre réellement et répond sur /health
+        # avant de la publier. Détecte les erreurs de runtime (ex: import
+        # manquant, permission denied) que les scans statiques ne voient pas.
         run: |
           docker run -d --name smoke-test -p 8000:8000 scan-target:latest
           echo "Attente du démarrage..."
@@ -170,7 +292,12 @@ jobs:
           docker stop smoke-test
           docker rm smoke-test
 
-      - name: Build et push - tag staging
+      - name: Build et push — tag staging
+        # Seulement ici, après TOUS les contrôles, on publie l'image.
+        # provenance: false / sbom: false → on gère notre propre SBOM
+        # avec Syft (plus loin), pour garder le contrôle du format et
+        # éviter que docker buildx génère un OCI Image Index qui
+        # changerait le digest lors de la promotion skopeo.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -184,19 +311,69 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.version.outputs.VERSION }}
-            org.opencontainers.image.description=Image staging validée (SonarQube/Grype)
+            org.opencontainers.image.description=Image staging (TruffleHog/pip-audit/SonarQube/Grype/Syft/Cosign)
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Installer Syft
+        # Syft (Anchore) génère le SBOM — inventaire exhaustif de tous
+        # les composants de l'image : paquets OS, libs, dépendances Python.
+        # Éditeur identique à Grype : les deux sont conçus pour travailler
+        # ensemble (Syft génère, Grype scanne).
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Générer le SBOM (CycloneDX + SPDX)
+        # Deux formats standards car les exigences varient selon le client :
+        # - CycloneDX : standard OWASP, très utilisé en industrie (dont automobile)
+        # - SPDX      : standard Linux Foundation, préféré en Europe et open source
+        # On scanne l'image distante (pas scan-target locale) pour avoir
+        # le SBOM de l'artefact réel publié dans le registre.
+        run: |
+          syft \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.version.outputs.VERSION }} \
+            -o cyclonedx-json=sbom-staging-${{ steps.version.outputs.VERSION }}.cdx.json \
+            -o spdx-json=sbom-staging-${{ steps.version.outputs.VERSION }}.spdx.json
+
+      - name: Publier le SBOM comme artifact (90 jours)
+        # Le SBOM est conservé 90 jours comme pièce justificative.
+        # En contexte automobile (IEC 62443, ISO/SAE 21434), le SBOM
+        # est une exigence contractuelle : le client doit pouvoir savoir
+        # en moins de 24h si un composant vulnérable est présent.
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-staging-${{ steps.version.outputs.VERSION }}
+          path: |
+            sbom-staging-${{ steps.version.outputs.VERSION }}.cdx.json
+            sbom-staging-${{ steps.version.outputs.VERSION }}.spdx.json
+          retention-days: 90
 
       - name: Installer Cosign
         uses: sigstore/cosign-installer@v3.6.0
 
+      - name: Attacher le SBOM à l'image (Cosign attest)
+        # cosign attest ≠ cosign sign :
+        # - cosign sign   → prouve "cette image est authentique"
+        # - cosign attest → attache un document (ici le SBOM) à l'image,
+        #                   signé cryptographiquement, vérifiable via
+        #                   "cosign verify-attestation"
+        # Le SBOM est ainsi indissociable de l'image dans le registre.
+        run: |
+          cosign attest --yes \
+            --predicate sbom-staging-${{ steps.version.outputs.VERSION }}.cdx.json \
+            --type cyclonedx \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.version.outputs.VERSION }}
+
       - name: Signer l'image avec Cosign (keyless, OIDC GitHub)
+        # Signature keyless : pas de clé privée à gérer.
+        # GitHub fournit un jeton OIDC → Fulcio émet un certificat éphémère
+        # → la preuve est enregistrée dans Rekor (registre public immuable).
         run: |
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.version.outputs.VERSION }}
 
-      - name: Vérifier la signature Cosign
+      - name: Vérifier la signature Cosign (auto-contrôle)
+        # Auto-contrôle immédiat : si cosign verify échoue ici, le pipeline
+        # s'arrête et l'image ne sera jamais promue en stable.
         run: |
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/" \
@@ -205,6 +382,25 @@ jobs:
 
       - name: Résumé
         run: |
-          echo "Image publiée et signée : ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.version.outputs.VERSION }}"
-          echo "Scans effectués : TruffleHog + pip-audit + SonarQube + Grype"
-          echo "Cette image est candidate à la promotion en stable, SANS reconstruction."
+          echo "════════════════════════════════════════════════════════"
+          echo "  Image Staging publiée et sécurisée"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          echo "  Image : ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.version.outputs.VERSION }}"
+          echo ""
+          echo "  Contrôles effectués :"
+          echo "  ✅ TruffleHog       — secrets dans le code (BLOQUANT)"
+          echo "  ✅ pip-audit        — CVE dépendances Python (BLOQUANT)"
+          echo "  ✅ OWASP DC         — CVE multi-langages (informatif)"
+          echo "  ✅ Hadolint         — lint Dockerfile (BLOQUANT)"
+          echo "  ✅ SonarQube        — SAST + couverture de code (BLOQUANT)"
+          echo "  ✅ Grype            — CVE image Docker (BLOQUANT)"
+          echo "  ✅ Smoke test       — démarrage et /health vérifiés"
+          echo "  ✅ Syft             — SBOM CycloneDX + SPDX générés"
+          echo "  ✅ Cosign attest    — SBOM attaché à l'image"
+          echo "  ✅ Cosign sign      — image signée (keyless OIDC)"
+          echo "  ✅ Cosign verify    — signature auto-vérifiée"
+          echo ""
+          echo "  Cette image est candidate à la promotion en Stable."
+          echo "  Elle ne sera JAMAIS reconstruite : promotion = copie skopeo."
+          echo "════════════════════════════════════════════════════════"
