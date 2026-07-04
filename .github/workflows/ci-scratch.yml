@@ -1,4 +1,46 @@
-name: CI - Scratch - Validation & Build - Next
+name: CI - Scratch - Validation & Build
+
+# =============================================================================
+# RÔLE DE CE PIPELINE
+# =============================================================================
+# Scratch = feedback rapide au développeur.
+# L'image produite est JETABLE (tag unique par run), destinée au
+# développement uniquement. Elle ne sera jamais promue en production.
+#
+# MÊME OUTILLAGE que ci-staging, mais en mode OBSERVATION :
+# tous les contrôles sont en continue-on-error: true ou fail-build: false.
+# L'objectif est de donner un retour au développeur SANS bloquer son travail,
+# tout en l'exposant progressivement aux mêmes exigences qu'en staging.
+#
+# Règle pédagogique :
+#   Scratch  → voir les problèmes, ne pas bloquer
+#   Staging  → mêmes contrôles, tout est bloquant
+#   Stable   → promotion skopeo, jamais de rebuild
+#
+# =============================================================================
+# ARCHITECTURE DES JOBS ET FLUX DE DONNÉES
+# =============================================================================
+#
+#   security-and-quality ──────────────────────────────────────────────────┐
+#   - TruffleHog (secrets)          continue-on-error: true                │
+#   - pip-audit (SCA Python)        continue-on-error: true                │ artifact
+#   - pytest + coverage.xml                                                │ "coverage-report"
+#   - Fix coverage paths                                                   │
+#   - SonarQube (SAST + qualité)    continue-on-error: true                │
+#   - Upload coverage.xml ─────────────────────────────────────────────────┤
+#                                                                          │
+#   dockerfile-lint ───────────────────────────────────────────────────────┤
+#   - Hadolint                      continue-on-error: true                │
+#                                                                          │
+#   build-scan-publish-scratch ◄───────────────────────────────────────────┘
+#   - Build image locale (scan-target)
+#   - Grype (CVE image)             fail-build: false
+#   - Smoke test
+#   - Build + push scratch-<run>-<sha>
+#   - Syft → SBOM CycloneDX + SPDX → artifact 7j
+#   - Cosign attest (SBOM attaché à l'image)
+#   - Cosign sign
+#   - Cosign verify
 
 on:
   push:
@@ -18,6 +60,12 @@ permissions:
   contents: read
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 1 : Sécurité & Qualité du code — mode OBSERVATION
+  # Tous les contrôles sont en continue-on-error: true.
+  # Le développeur VOIT les problèmes, mais n'est pas bloqué.
+  # Produit : coverage.xml (uploadé comme artifact pour SonarQube)
+  # ───────────────────────────────────────────────────────────────────────
   security-and-quality:
     runs-on: ubuntu-latest
     permissions:
@@ -26,15 +74,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Requis par SonarQube pour avoir l'historique Git complet
+          fetch-depth: 0  # Requis par TruffleHog et SonarQube
 
       - name: Scan de secrets (TruffleHog)
+        # En Scratch : informatif. Un secret trouvé apparaît dans les logs
+        # et dans le résumé du job, mais ne bloque pas le développeur.
+        # En Staging : BLOQUANT.
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
           base: ""
           head: HEAD
           extra_args: --debug
+        continue-on-error: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -45,22 +97,50 @@ jobs:
       - name: Installer les dépendances
         run: pip install -r requirements.txt
 
-      - name: Audit des dépendances (pip-audit)
+      - name: SCA - Audit des dépendances Python (pip-audit)
+        # En Scratch : informatif. Le développeur voit les CVE dans ses
+        # dépendances, mais peut continuer à itérer.
+        # En Staging : BLOQUANT (pas de continue-on-error).
         run: |
           pip install pip-audit
           pip-audit -r requirements.txt --desc --format=markdown
         continue-on-error: true
 
+      - name: SCA - OWASP Dependency-Check
+        # Informatif dans les deux niveaux (observation initiale).
+        # À rendre bloquant dans staging après analyse des premiers rapports.
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.event.repository.name }}
+          path: '.'
+          format: 'HTML'
+          out: 'reports/dependency-check'
+        continue-on-error: true
+
+      - name: Upload rapport OWASP Dependency-Check
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-dc-scratch-${{ github.run_number }}
+          path: reports/dependency-check
+          retention-days: 7
+
       - name: Tests & Génération de couverture (pytest)
+        # Les tests restent BLOQUANTS même en Scratch :
+        # du code qui ne passe pas ses propres tests ne devrait jamais
+        # être publié, même en jetable.
         run: |
           pip install pytest pytest-cov
-          pytest -v --cov=app --cov-report=xml # xml requis pour SonarQube
-      
+          pytest -v --cov=app --cov-report=xml
+
       - name: Fix coverage paths for SonarCloud
         run: |
           sed -i 's|/home/runner/work/devsecops-training-demo/devsecops-training-demo/||g' coverage.xml
 
       - name: Analyse SAST & Qualité (SonarQube)
+        # En Scratch : informatif. SonarQube analyse et remonte les
+        # problèmes dans son interface, mais ne bloque pas le pipeline.
+        # En Staging : BLOQUANT (Quality Gate strict).
         uses: sonarsource/sonarqube-scan-action@v3
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -74,7 +154,23 @@ jobs:
             -Dsonar.tests=tests/
             -Dsonar.python.version=3.12
             -Dsonar.python.coverage.reportPaths=coverage.xml
+        continue-on-error: true
 
+      - name: Upload coverage report
+        # Même architecture qu'en staging : coverage.xml est partagé
+        # entre jobs via artifact, pour que SonarQube l'ait disponible.
+        # Ici retention-days: 1 — fichier temporaire de pipeline.
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 1
+
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 2 : Validation du Dockerfile — mode OBSERVATION
+  # Hadolint est en continue-on-error: true en Scratch.
+  # En Staging : bloquant.
+  # ───────────────────────────────────────────────────────────────────────
   dockerfile-lint:
     runs-on: ubuntu-latest
     permissions:
@@ -89,7 +185,13 @@ jobs:
           dockerfile: Dockerfile
           config: .hadolint.yaml
           no-fail: false
+        continue-on-error: true
 
+  # ───────────────────────────────────────────────────────────────────────
+  # JOB 3 : Build, Scan image, Publish, SBOM & Sign
+  # Grype est en fail-build: false (informatif) en Scratch.
+  # En Staging : fail-build: true (bloquant).
+  # ───────────────────────────────────────────────────────────────────────
   build-scan-publish-scratch:
     needs: [security-and-quality, dockerfile-lint]
     runs-on: ubuntu-latest
@@ -103,6 +205,9 @@ jobs:
 
       - name: Définir un tag unique pour ce run
         id: meta
+        # Tag format : scratch-<numéro-de-run>-<7 premiers chars du SHA>
+        # Ex: scratch-42-a1b2c3d
+        # Unique par run, jamais réutilisé, traçable jusqu'au commit exact.
         run: |
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           echo "SCRATCH_TAG=scratch-${{ github.run_number }}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
@@ -117,7 +222,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build image locale (pour scan)
+      - name: Build image locale (scan-target, jamais publiée)
+        # On construit d'abord en local pour scanner avant publication.
+        # Même principe qu'en staging : "scan before publish".
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -129,14 +236,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan de l'image (Grype)
+      - name: Scan de l'image (Grype) — informatif
+        # En Scratch : fail-build: false → les CVE sont visibles dans les
+        # logs et dans l'interface Anchore, mais l'image est quand même
+        # publiée. Le développeur voit les problèmes sans être bloqué.
+        # En Staging : fail-build: true → toute CVE HIGH/CRITICAL bloque.
         uses: anchore/scan-action@v5
         with:
           image: "scan-target:latest"
-          fail-build: false # Permet de créer et publier l'image dans toutes les conditions
+          fail-build: false
           severity-cutoff: "high"
 
       - name: Smoke test du conteneur
+        # Le smoke test reste BLOQUANT même en Scratch : si le conteneur
+        # ne démarre pas ou ne répond pas sur /health, l'image ne sera
+        # pas publiée. C'est le minimum non négociable.
         run: |
           docker run -d --name smoke-test -p 8000:8000 scan-target:latest
           echo "Attente du démarrage..."
@@ -149,6 +263,8 @@ jobs:
           docker rm smoke-test
 
       - name: Build et push image scratch
+        # provenance: false / sbom: false → on gère notre propre SBOM
+        # avec Syft, pour garder le contrôle du format et du digest.
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -162,14 +278,44 @@ jobs:
             APP_VERSION=${{ steps.meta.outputs.SCRATCH_TAG }}
           labels: |
             org.opencontainers.image.title=${{ env.IMAGE_NAME }}
-            org.opencontainers.image.description=Image scratch de démonstration/training (Grype/Sonar)
+            org.opencontainers.image.description=Image scratch (TruffleHog/pip-audit/SonarQube/Grype/Syft/Cosign)
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Installer Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Générer le SBOM (CycloneDX + SPDX)
+        # Même outillage qu'en staging. Le SBOM de l'image scratch permet
+        # de tracer les composants même sur les versions de développement.
+        # Durée de rétention : 7j (jetable, vs 90j en staging).
+        run: |
+          syft \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SCRATCH_TAG }} \
+            -o cyclonedx-json=sbom-${{ steps.meta.outputs.SCRATCH_TAG }}.cdx.json \
+            -o spdx-json=sbom-${{ steps.meta.outputs.SCRATCH_TAG }}.spdx.json
+
+      - name: Publier le SBOM comme artifact (7 jours)
+        # 7j en Scratch (jetable) vs 90j en Staging (livrable contractuel).
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.meta.outputs.SCRATCH_TAG }}
+          path: |
+            sbom-${{ steps.meta.outputs.SCRATCH_TAG }}.cdx.json
+            sbom-${{ steps.meta.outputs.SCRATCH_TAG }}.spdx.json
+          retention-days: 7
+
       - name: Installer Cosign
         uses: sigstore/cosign-installer@v3.6.0
+
+      - name: Attacher le SBOM à l'image (Cosign attest)
+        run: |
+          cosign attest --yes \
+            --predicate sbom-${{ steps.meta.outputs.SCRATCH_TAG }}.cdx.json \
+            --type cyclonedx \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SCRATCH_TAG }}
 
       - name: Signer les images avec Cosign (keyless, OIDC GitHub)
         run: |
@@ -178,15 +324,35 @@ jobs:
           cosign sign --yes \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:scratch-latest
 
-      - name: Vérifier la signature Cosign
+      - name: Vérifier la signature Cosign (auto-contrôle)
         run: |
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SCRATCH_TAG }}
 
-      - name: Résumé de publication
+      - name: Résumé
         run: |
-          echo "Image scratch publiée avec succès (Scan Grype effectué) :"
-          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SCRATCH_TAG }}"
-          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:scratch-latest"
+          echo "════════════════════════════════════════════════════════"
+          echo "  Image Scratch publiée"
+          echo "════════════════════════════════════════════════════════"
+          echo ""
+          echo "  Image : ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.SCRATCH_TAG }}"
+          echo "  Tag   : scratch-latest"
+          echo ""
+          echo "  Contrôles effectués (mode OBSERVATION) :"
+          echo "  ⚠️  TruffleHog       — secrets (informatif)"
+          echo "  ⚠️  pip-audit        — CVE Python (informatif)"
+          echo "  ⚠️  OWASP DC         — CVE multi-langages (informatif)"
+          echo "  ⚠️  Hadolint         — lint Dockerfile (informatif)"
+          echo "  ⚠️  SonarQube        — SAST + couverture (informatif)"
+          echo "  ⚠️  Grype            — CVE image (informatif)"
+          echo "  ✅  Smoke test       — démarrage et /health (BLOQUANT)"
+          echo "  ✅  Syft             — SBOM CycloneDX + SPDX"
+          echo "  ✅  Cosign attest    — SBOM attaché à l'image"
+          echo "  ✅  Cosign sign      — image signée (keyless OIDC)"
+          echo "  ✅  Cosign verify    — signature auto-vérifiée"
+          echo ""
+          echo "  ⚠️  Image JETABLE — développement uniquement."
+          echo "  Pour la production : pipeline staging → promote."
+          echo "════════════════════════════════════════════════════════"
