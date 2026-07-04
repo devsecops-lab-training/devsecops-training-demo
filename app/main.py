@@ -11,6 +11,7 @@ app = FastAPI(title="devsecops-training-demo")
 app.middleware("http")(combined_middleware)
 app.include_router(auth_router)
 
+
 @app.get("/health")
 def health() -> dict:
     """Endpoint de santé."""
