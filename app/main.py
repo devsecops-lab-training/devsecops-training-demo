@@ -5,10 +5,11 @@ Application FastAPI minimale - support d'entraînement DevSecOps.
 import time
 from fastapi import FastAPI, Request
 from app.middleware import combined_middleware
+from app.auth import router as auth_router
 
 app = FastAPI(title="devsecops-training-demo")
 app.middleware("http")(combined_middleware)
-
+app.include_router(auth_router)
 
 @app.get("/health")
 def health() -> dict:
