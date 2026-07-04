@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
+import time
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -41,8 +42,7 @@ def login(credentials: LoginRequest):
             detail="Invalid credentials",
         )
 
-    fake_token = f"token_{credentials.username}_xyz789"
-
+    fake_token = f"token_{credentials.username}_{int(time.time())}"
     return LoginResponse(
         success=True,
         message="Login successful",
