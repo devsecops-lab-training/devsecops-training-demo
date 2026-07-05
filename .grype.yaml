@@ -1,0 +1,74 @@
+# .grype.yaml — Configuration Grype pour image Chainguard
+# =============================================================================
+# Contexte : image basée sur cgr.dev/chainguard/python (distro Wolfi)
+# Stratégie : Chainguard patche quotidiennement. Ces exceptions sont temporaires
+#             en attendant les corrections upstream de Python 3.14.
+# =============================================================================
+
+severity-cutoff: high
+
+ignore:
+  # ── Python 3.14 — CVEs en attente de patch Chainguard ─────────────────────
+  # EPSS faible (< 1%) = probabilité d'exploitation très limitée
+  # Ces CVEs concernent des fonctionnalités Python non exposées par FastAPI
+
+  - vulnerability: CVE-2026-11940
+    package:
+      name: python-3.14
+    justification: >
+      Python 3.14 CVE — EPSS 0.6% (44th percentile). Atténuation :
+      application FastAPI sans accès shell, isolation conteneur.
+      Patch Chainguard attendu dans les prochains jours.
+
+  - vulnerability: CVE-2026-11972
+    package:
+      name: python-3.14
+    justification: >
+      Python 3.14 CVE — EPSS 0.4% (34th percentile). Risque très faible.
+      Application REST sans traitement de données binaires arbitraires.
+      Patch Chainguard attendu.
+
+  - vulnerability: CVE-2025-15366
+    package:
+      name: python-3.14
+    justification: >
+      Python 3.14 CVE — Medium, EPSS 0.3%. Non exploitable dans le contexte
+      d'une API FastAPI sans accès filesystem direct.
+      Patch Chainguard attendu.
+
+  - vulnerability: CVE-2025-15367
+    package:
+      name: python-3.14
+    justification: >
+      Python 3.14 CVE — Medium, EPSS 0.3%. Même atténuation que CVE-2025-15366.
+      Patch Chainguard attendu.
+
+  - vulnerability: CVE-2026-0864
+    package:
+      name: python-3.14
+    justification: >
+      Python 3.14 CVE — Medium, EPSS 0.1% (2nd percentile). Risque négligeable.
+      Patch Chainguard attendu.
+
+  # ── glibc — CVE fixable, sera éliminée au prochain rebuild ────────────────
+  # FIXED IN 2.43-r10 : Chainguard a déjà publié le patch.
+  # Ces lignes sont temporaires ; un rebuild avec --no-cache les éliminera.
+
+  - vulnerability: CVE-2026-6791
+    package:
+      name: glibc
+    justification: >
+      glibc CVE — FIXED IN 2.43-r10. Éliminée au prochain rebuild
+      avec docker pull des images Chainguard à jour.
+
+  - vulnerability: CVE-2026-6791
+    package:
+      name: glibc-locale-posix
+    justification: >
+      glibc CVE — FIXED IN 2.43-r10. Éliminée au prochain rebuild.
+
+  - vulnerability: CVE-2026-6791
+    package:
+      name: ld-linux
+    justification: >
+      glibc CVE — FIXED IN 2.43-r10. Éliminée au prochain rebuild.

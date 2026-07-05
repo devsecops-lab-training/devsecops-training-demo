@@ -1,46 +1,49 @@
 # =============================================================================
-# Dockerfile durci — DevSecOps Training Demo
+# Dockerfile — DevSecOps Training Demo (Chainguard Production Ready)
 # =============================================================================
-FROM python:3.12-slim-bookworm AS builder
-WORKDIR /build
 
-RUN apt-get update && \
-    apt-get upgrade -y && \
-    apt-get install -y --no-install-recommends gcc libc6-dev && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# ── STAGE 1 : Build ─────────────────────────────────────────────────────────
+# On utilise l'image -dev qui contient tous les outils nécessaires (pip, gcc...)
+FROM cgr.dev/chainguard/python:latest-dev AS builder
+
+# On se place dans le home de l'utilisateur nonroot pour éviter les conflits de droits
+WORKDIR /home/nonroot/app
+
+# Création et activation de l'environnement virtuel pour isoler les paquets
+RUN python -m venv venv
+ENV PATH="/home/nonroot/app/venv/bin:$PATH"
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-slim-bookworm
-WORKDIR /app
 
-RUN apt-get update && \
-    apt-get upgrade -y && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+# ── STAGE 2 : Runtime ───────────────────────────────────────────────────────
+# Image finale minimale SANS le suffixe -dev : aucune CVE à l'horizon (0 outil superflu)
+FROM cgr.dev/chainguard/python:latest
 
-# Créer l'utilisateur non-root AVANT de copier les fichiers,
-# pour pouvoir lui en attribuer la propriété directement.
-RUN groupadd -r appgroup && useradd -r -m -g appgroup appuser
+WORKDIR /home/nonroot/app
 
-# Copier les packages Python dans le HOME de appuser (pas /root),
-# et lui en donner la propriété explicitement.
-COPY --from=builder --chown=appuser:appgroup /root/.local /home/appuser/.local
-ENV PATH=/home/appuser/.local/bin:$PATH
+# Copie de l'environnement virtuel et du code avec les bons droits d'exécution
+COPY --from=builder /home/nonroot/app/venv ./venv
+COPY --chown=nonroot:nonroot app/ ./app/
 
-COPY --chown=appuser:appgroup app/ ./app/
+# Configuration des variables d'environnement pour le venv
+ENV VIRTUAL_ENV=/home/nonroot/app/venv
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV PYTHONUNBUFFERED=1
 
+# Version de l'application passée au build
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
 
-USER appuser
-
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+# On force l'ENTRYPOINT sur le binaire Python du venv pour court-circuiter celui de Chainguard
+ENTRYPOINT ["/home/nonroot/app/venv/bin/python", "-m", "uvicorn"]
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Le CMD ne contient plus que les arguments par défaut transmis à uvicorn
+CMD ["app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+# Healthcheck utilisant le module natif http.client (compatible avec l'image minimale distroless)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD /home/nonroot/app/venv/bin/python -c "import http.client; c=http.client.HTTPConnection('localhost', 8000); c.request('GET', '/health'); r=c.getresponse(); exit(0 if r.status==200 else 1)"
