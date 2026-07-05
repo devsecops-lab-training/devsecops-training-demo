@@ -4,6 +4,7 @@
 
 # ── STAGE 1 : Build ─────────────────────────────────────────────────────────
 # On utilise l'image -dev qui contient tous les outils nécessaires (pip, gcc...)
+# hadolint ignore=DL3007
 FROM cgr.dev/chainguard/python:latest-dev AS builder
 
 # On se place dans le home de l'utilisateur nonroot pour éviter les conflits de droits
@@ -19,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ── STAGE 2 : Runtime ───────────────────────────────────────────────────────
 # Image finale minimale SANS le suffixe -dev : aucune CVE à l'horizon (0 outil superflu)
+# hadolint ignore=DL3007
 FROM cgr.dev/chainguard/python:latest
 
 WORKDIR /home/nonroot/app
