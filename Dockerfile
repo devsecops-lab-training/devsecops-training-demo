@@ -1,7 +1,7 @@
 # =============================================================================
 # Dockerfile durci — DevSecOps Training Demo
 # =============================================================================
-FROM python:3.12-bookworm AS builder
+FROM python:3.12-slim-bookworm AS builder
 WORKDIR /build
 
 RUN apt-get update && \
@@ -14,7 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.12-bookworm
+FROM python:3.12-slim-bookworm
 WORKDIR /app
 
 RUN apt-get update && \
