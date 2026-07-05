@@ -246,6 +246,7 @@ jobs:
           image: "scan-target:latest"
           fail-build: false
           severity-cutoff: "high"
+          output-format: table
 
       - name: Smoke test du conteneur
         # Le smoke test reste BLOQUANT même en Scratch : si le conteneur
